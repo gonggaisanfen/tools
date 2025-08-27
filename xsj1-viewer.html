@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>XSJ 查看器+导出器 (fix)</title>
+  <script src="https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/dist/pouchdb.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/pouchdb-load@7.2.2/dist/pouchdb.load.min.js"></script>
+  <style>body{font-family:system-ui,Segoe UI,Arial;max-width:720px;margin:24px auto;padding:0 12px}</style>
+</head>
+<body>
+  <h2>拖入 .xsj.txt 文件</h2>
+  <input type="file" id="fileInput" />
+  <button id="exportBtn" disabled>导出 Markdown + 图片</button>
+  <div id="status"></div>
+
+  <script>
+    let currentDB = null;
+
+    function say(msg){ document.getElementById('status').innerText = msg; }
+    async function saveFile(name, content){
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(new Blob([content]));
+      a.download=name; a.click();
+    }
+    async function saveImage(name, blob){
+      const a=document.createElement('a');
+      a.href=URL.createObjectURL(blob);
+      a.download='images/'+name; a.click();
+    }
+
+    document.getElementById('fileInput').addEventListener('change', async (e) => {
+      const file = e.target.files[0]; if(!file) return;
+      if(typeof PouchDB.load !== 'function'){
+        say('加载失败：PouchDB.load 未注册。请确认 pouchdb-load 脚本已成功加载。');
+        return;
+      }
+      say('加载中…（大文件可能需要一点时间）');
+
+      try{
+        const dumpText = await file.text();
+        const dbname = 'xsj-view';
+        try { await new PouchDB(dbname).destroy(); } catch(_) {}
+        currentDB = new PouchDB(dbname);
+
+        // 关键修正：用 PouchDB.load，而不是 db.load
+        await PouchDB.load(currentDB, dumpText);
+
+        document.getElementById('exportBtn').disabled = false;
+        say('加载成功！可点击“导出”，或用 DevTools 的 PouchDB Inspector 查看库 xsj-view。');
+      }catch(err){
+        say('加载失败：' + (err && err.message ? err.message : String(err)));
+      }
+    });
+
+    document.getElementById('exportBtn').addEventListener('click', async () => {
+      if(!currentDB) return;
+      say('导出中…');
+      const all = await currentDB.allDocs({include_docs:true, attachments:true, binary:true});
+      let count=0, imgCount=0;
+
+      for(const row of all.rows){
+        const doc = row.doc;
+        if(!doc) continue;
+
+        // 文字：小书匠常用字段：content（markdown）或 body / markdown
+        const md = doc.content || doc.markdown || doc.body || '';
+        if(md){
+          const title = (doc.title || ('untitled-'+count)).replace(/[\\/:*?"<>|]/g,'_');
+          await saveFile(title + '.md', md);
+          count++;
+        }
+
+        // 附件（若 dump 真含二进制）
+        if(doc._attachments){
+          for(const [name, meta] of Object.entries(doc._attachments)){
+            if(meta && meta.data){
+              const blob = new Blob([meta.data], {type: meta.content_type || 'application/octet-stream'});
+              await saveImage(name, blob);
+              imgCount++;
+            }
+          }
+        }
+      }
+      say(`导出完成：${count} 篇文档，${imgCount} 个附件。（若图片很少，说明导出的是链接占位，需在原插件选择“包含附件/打包 ZIP”重导）`);
+    });
+  </script>
+</body>
+</html>
