@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>XSJ 查看器（无 pouchdb-load 版）</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script src="https://cdn.jsdelivr.net/npm/pouchdb@8.0.1/dist/pouchdb.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+<style>
+  :root { --bg:#0b0c0f; --fg:#eaeef2; --mut:#9aa4af; --hl:#2b5cff; --card:#14161c; }
+  body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,Segoe UI,Arial}
+  header{display:flex;gap:8px;align-items:center;padding:12px 16px;border-bottom:1px solid #1f2330}
+  button,input{background:#1a1d26;color:var(--fg);border:1px solid #272c3a;border-radius:8px;padding:8px 10px}
+  button:hover{border-color:#3a4157}
+  #status{color:var(--mut);margin-left:auto}
+  main{display:grid;grid-template-columns:320px 1fr;min-height:calc(100vh - 58px)}
+  aside{border-right:1px solid #1f2330;overflow:auto}
+  #list{padding:8px}
+  .item{padding:8px;border-radius:8px;cursor:pointer}
+  .item:hover{background:#151924}
+  .active{background:#1b2340}
+  .mut{color:var(--mut);font-size:12px}
+  .title{font-weight:600}
+  section{padding:16px;overflow:auto}
+  pre{white-space:pre-wrap;background:var(--card);padding:12px;border-radius:10px;border:1px solid #22283a}
+  .att{display:flex;flex-wrap:wrap;gap:8px;margin-top:8px}
+  .thumb{background:var(--card);border:1px solid #22283a;border-radius:10px;padding:8px}
+  .thumb img{max-width:180px;max-height:120px;display:block}
+</style>
+</head>
+<body>
+<header>
+  <input type="file" id="fileInput" />
+  <button id="btnExport" disabled>导出 Markdown + 附件</button>
+  <button id="btnZip" disabled>一键打包 ZIP</button>
+  <input id="q" placeholder="搜索标题/标签" style="flex:1" />
+  <div id="status">未加载</div>
+</header>
+
+<main>
+  <aside><div id="list"></div></aside>
+  <section>
+    <h2 id="vTitle">—</h2>
+    <div class="mut" id="vMeta"></div>
+    <h3>正文</h3>
+    <pre id="vBody">—</pre>
+    <h3>附件</h3>
+    <div class="att" id="vAtt">—</div>
+  </section>
+</main>
+
+<script>
+let DB=null, allRows=[], filtered=[];
+const S = id => document.getElementById(id);
+const say = t => S('status').textContent=t;
+const safeName = s => (s||'').toString().replace(/[\\/:*?"<>|]/g,'_');
+
+function renderList(rows){
+  const q = S('q').value.trim().toLowerCase();
+  filtered = rows.filter(r=>{
+    const d=r.doc||{};
+    const hay=[d.title,(d.tagNames||[]).join(','),d.fullPath,d.sysTitle].join(' ').toLowerCase();
+    return hay.includes(q);
+  });
+  S('list').innerHTML = filtered.map((r,i)=>{
+    const d=r.doc||{};
+    const title=d.title||d.sysTitle||d.fullPath||('[无标题-'+i+']');
+    const tags=(d.tagNames&&d.tagNames.length)?` · ${d.tagNames.join(', ')}`:'';
+    return `<div class="item" data-i="${i}">
+      <div class="title">${title}</div>
+      <div class="mut">${d.updateDate||''}${tags}</div>
+    </div>`;
+  }).join('') || `<div class="mut" style="padding:12px">无结果</div>`;
+}
+S('list').addEventListener('click', e=>{
+  const el=e.target.closest('.item'); if(!el) return; show(Number(el.dataset.i));
+});
+S('q').addEventListener('input', ()=>renderList(allRows));
+
+async function show(i){
+  const row=filtered[i]; if(!row) return;
+  [...S('list').children].forEach((el,idx)=>el.classList.toggle('active', idx===i));
+  const d=row.doc||{};
+  const title=d.title||d.sysTitle||d.fullPath||'无标题';
+  const md=d.content||d.markdown||d.body||'';
+  S('vTitle').textContent=title;
+  S('vMeta').textContent=[d.fullPath,(d.tagNames||[]).join(', ')].filter(Boolean).join(' · ')||'—';
+  S('vBody').textContent=md||'（空）';
+
+  const box=S('vAtt'); box.innerHTML='';
+  if(d._attachments && Object.keys(d._attachments).length){
+    for(const [name,meta] of Object.entries(d._attachments)){
+      const ct=meta.content_type||'application/octet-stream';
+      if(meta.data){
+        const blob=new Blob([meta.data],{type:ct});
+        const url=URL.createObjectURL(blob);
+        const isImg=/^image\\//.test(ct);
+        const div=document.createElement('div'); div.className='thumb';
+        div.innerHTML=`<div class="mut">${name}</div>`+(isImg?`<img src="${url}">`:'');
+        const a=document.createElement('a'); a.textContent='下载'; a.href=url; a.download='images/'+name;
+        a.style.display='inline-block'; a.style.marginTop='6px'; div.appendChild(a);
+        box.appendChild(div);
+      }else{
+        const div=document.createElement('div'); div.className='thumb';
+        div.innerHTML=`<div class="mut">${name}</div><div class="mut">（无内嵌数据，可能是链接占位 text/xsj-link）</div>`;
+        box.appendChild(div);
+      }
+    }
+  }else{ box.textContent='—'; }
+}
+
+async function fallbackLoader(db, text){
+  // 兼容多种导出：整块 JSON / 多行 JSON / NDJSON
+  let docs=[];
+  const tryPush = obj=>{
+    if(!obj) return;
+    if(Array.isArray(obj.docs)) docs.push(...obj.docs);
+    if(obj.rows && Array.isArray(obj.rows)) docs.push(...obj.rows.map(r=>r.doc).filter(Boolean));
+    if(obj._id) docs.push(obj);
+  };
+  // 尝试整体 parse
+  try{ tryPush(JSON.parse(text)); }catch(_){
+    // 按行/按 }{ 分割粗暴解析
+    const parts = text.split(/\\n+/).concat(text.split(/}\\s*{/) );
+    const seen=new Set();
+    for(const p of parts){
+      const s = (p.startsWith('{')?p:('{'+p)).trim();
+      try{
+        const o = JSON.parse(s.endsWith('}')?s:(s+'}'));
+        const k = o && (o._id||o.version||o.seq||Math.random());
+        if(!seen.has(k)){ tryPush(o); seen.add(k); }
+      }catch(e){ /* 忽略碎片 */ }
+    }
+  }
+  // 过滤掉设计文档
+  docs = docs.filter(d=>d && d._id && !String(d._id).startsWith('_design/'));
+  // 批量写入
+  if(docs.length) await db.bulkDocs(docs, {new_edits:true});
+  return docs.length;
+}
+
+S('fileInput').addEventListener('change', async (e)=>{
+  const f=e.target.files[0]; if(!f) return;
+  say('加载中…');
+  try{
+    const dump=await f.text();
+    try{ await new PouchDB('xsj-view').destroy(); }catch(_){}
+    DB=new PouchDB('xsj-view');
+
+    // 仅使用本地解析器
+    const n = await fallbackLoader(DB, dump);
+
+    const res = await DB.allDocs({include_docs:true, attachments:true, binary:true});
+    allRows = res.rows.filter(r=>r.doc && !r.doc._id.startsWith('_design/'));
+    renderList(allRows); if(filtered.length) show(0);
+    S('btnExport').disabled=false; S('btnZip').disabled=false;
+    say(`加载成功：写入 ${n} 条，当前可见 ${allRows.length} 条`);
+  }catch(err){
+    say('加载失败：'+(err?.message||err));
+  }
+});
+
+async function download(name, blob){
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob); a.download=name; a.click();
+}
+
+S('btnExport').addEventListener('click', async ()=>{
+  if(!DB) return;
+  say('导出中…（多文件下载可能被浏览器询问权限）');
+  let docN=0, attN=0;
+  for(const r of allRows){
+    const d=r.doc||{};
+    const md=d.content||d.markdown||d.body||'';
+    const title=safeName(d.title||d.sysTitle||d.fullPath||('untitled-'+docN));
+    if(md){ await download(title+'.md', new Blob([md],{type:'text/markdown'})); docN++; }
+    if(d._attachments){
+      for(const [n,meta] of Object.entries(d._attachments)){
+        if(meta?.data){ await download('images/'+n, new Blob([meta.data],{type:meta.content_type||'application/octet-stream'})); attN++; }
+      }
+    }
+  }
+  say(`导出完成：${docN} 篇、${attN} 个附件（若附件很少，说明原 dump 未含二进制，只是链接占位）`);
+});
+
+S('btnZip').addEventListener('click', async ()=>{
+  if(!DB) return; say('打包 ZIP 中…');
+  const zip=new JSZip(); let docN=0, attN=0;
+  for(const r of allRows){
+    const d=r.doc||{}; const md=d.content||d.markdown||d.body||'';
+    const title=safeName(d.title||d.sysTitle||d.fullPath||('untitled-'+docN));
+    if(md){ zip.file(title+'.md', md); docN++; }
+    if(d._attachments){
+      for(const [n,meta] of Object.entries(d._attachments)){
+        if(meta?.data){ zip.file('images/'+n, meta.data, {binary:true}); attN++; }
+      }
+    }
+  }
+  const blob=await zip.generateAsync({type:'blob'}); await download('xsj-export.zip', blob);
+  say(`ZIP 完成：${docN} 篇、${attN} 个附件`);
+});
+</script>
+</body>
+</html>
